@@ -1,0 +1,29 @@
+# Packaging for the shared OAuth library `mcp_oauth`. This repo IS the package: other
+# services install it straight from git, e.g.
+#
+#   pip install "mcp-oauth @ git+https://github.com/ZabelTech/auth-mcp@<ref>"
+#
+# Hosts (genoscope-mcp, activities-mcp) depend on it this way and wire their own config
+# in at startup via mcp_oauth.configure() — see README.md.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-oauth"
+version = "0.1.0"
+description = "Shared OAuth 2.1 resource-server gate + self-hosted authorization server for MCP HTTP surfaces"
+readme = "README.md"
+requires-python = ">=3.11"
+# Only the direct, non-host-provided dependency is declared. mcp / starlette / pydantic /
+# cryptography are intentionally NOT listed: every host already pins them (and pins
+# starlette transitively via FastAPI — see each host's requirements.txt), so declaring
+# them here would risk resolving a different starlette out from under FastAPI. pyjwt
+# brings cryptography via the [crypto] extra.
+dependencies = ["pyjwt[crypto]>=2.10"]
+
+[project.urls]
+Homepage = "https://github.com/ZabelTech/auth-mcp"
+
+[tool.setuptools]
+packages = ["mcp_oauth"]

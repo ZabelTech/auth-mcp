@@ -1,0 +1,13 @@
+# Python caches + virtualenvs
+__pycache__/
+*.py[cod]
+.venv/
+.venv-*/
+
+# Packaging build artifacts
+build/
+dist/
+*.egg-info/
+
+# Claude Code local config + runtime state (machine-local, not project code)
+.claude/

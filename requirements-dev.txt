@@ -1,0 +1,18 @@
+# Test/CI dependencies for running mcp_oauth's own suite standalone.
+#
+# The package's pyproject declares ONLY pyjwt[crypto]: mcp / starlette / pydantic /
+# cryptography are host-provided at runtime (every host pins them, and pins starlette
+# transitively via FastAPI). To exercise the package on its own, pin the same surface the
+# hosts do so the tests run against the starlette the hosts actually ship.
+#
+# fastapi==0.115.* transitively holds starlette <0.47, so installing mcp here will NOT
+# upgrade starlette out from under FastAPI (a bare `pip install mcp` would) — the same
+# constraint the host requirements.txt files document.
+fastapi==0.115.*
+mcp==1.27.*
+pyjwt[crypto]>=2.10
+python-multipart>=0.0.7
+
+# The package itself (editable), so `import mcp_oauth` resolves and the pyproject dep set
+# is honoured.
+-e .
