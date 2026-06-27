@@ -32,7 +32,9 @@ Today's relevant facts (all in `mcp_oauth/auth_server.py`):
 - Add a `refresh_token` grant so clients renew access without re-login.
 - Decouple access-token lifetime from re-login cadence: access tokens go back to short
   (default 1 h); refresh tokens carry the long lifetime (default 30 days).
-- Support **refresh-token rotation** with reuse detection (OAuth 2.1 BCP).
+- Support **refresh-token rotation** with reuse detection (OAuth 2.1 BCP) as a *configurable*
+  posture (§5a / §11); a non-rotating static refresh token is the simpler alternative for a
+  single-user deploy and the recommended starting point.
 - Stay within the package's constraints: host-injected config, no new runtime dependency
   beyond `pyjwt[crypto]` (stdlib `sqlite3` is acceptable for store option C), and **no new
   network service** — the rotation state lives in-process or in a local volume-backed file,
@@ -99,6 +101,8 @@ as_access_ttl()`:
 `["authorization_code", "refresh_token"]` when refresh is enabled.
 
 ### 4.2 Renewal (`grant_type=refresh_token`) — new branch in `token()`
+0. **Gate**: if `as_refresh_enabled()` is false, return `unsupported_grant_type` (defense in
+   depth — the metadata already omits the grant). Steps below run only when enabled.
 1. Require `refresh_token` form field; decode + verify with `_refresh_secret()`, requiring
    `["exp", "jti", "typ", "sub", "sid", "gen"]`; reject if `typ != "refresh"`.
 2. **Resource binding**: if the request sends `resource`, it must equal the token's `res`
@@ -114,9 +118,11 @@ as_access_ttl()`:
 `token_endpoint_auth_methods_supported` stays `["none"]` (public client); the refresh
 token itself is the bearer credential for renewal.
 
-## 5. Rotation & reuse detection (stateless baseline)
+## 5. Rotation & reuse detection (rotation-on path; in-memory, no DB)
 
-OAuth 2.1 requires rotation for public clients. We do it without a DB, exploiting the
+This section specifies the **rotation-enabled** posture (`as_refresh_rotation() == True`);
+§5a covers the simpler non-rotating alternative, and §11 is where the choice is made. OAuth
+2.1 recommends rotation for public clients; we do it without a DB, exploiting the
 single-machine deploy and the existing in-memory `jti` pattern.
 
 Per-session state map (mirrors `_seen_jti`; lives for process lifetime):
@@ -156,6 +162,23 @@ _refresh_chain: dict[sid, {gen: int, token: str, rotated_at: int, exp: int}]
 - Bound memory: prune an entry lazily once `entry.exp` is in the past (checked on access /
   on a size threshold). Same growth concern as `_seen_jti`; document the bound.
 
+**Load-bearing process model.** The in-memory store is correct *only* under the deploy's
+actual runtime: a **single** uvicorn worker (the image's `CMD` is `uvicorn webapp:app` with
+no `--workers`, so one process) on a **single-threaded asyncio** loop. Two constraints the
+implementation must preserve:
+- The read-modify-write of `_refresh_chain` (lookup → mint → store) must contain **no
+  `await`**. Then it runs to completion without yielding the loop, so each rotation is atomic
+  against concurrent refreshes — two parallel requests bearing the same token cannot both
+  rotate (which would mint two divergent successors and leave an orphan). `jwt.encode` is
+  synchronous, so this holds today; a future **async** store (e.g. aiosqlite under option C)
+  reintroduces an `await` mid-section and then needs a per-`sid` `asyncio.Lock`. A
+  *synchronous* `sqlite3` call keeps the section await-free and atomic.
+- A second worker/process (`--workers N`, Gunicorn, scale-out) splits the map and breaks
+  **both** refresh rotation and the existing `_seen_jti` auth-code single-use. This is
+  already an implicit assumption of today's code; the refresh chain makes it load-bearing —
+  assert single-worker in a startup comment, and treat multi-node as the trigger for option
+  C/Redis (§7).
+
 The grace window closes the **rotation-retry race**: without it, any lost rotation response
 (network blip, client crash mid-exchange, 5xx) would trip reuse detection and force a full
 re-login — defeating the spec's purpose.
@@ -168,8 +191,30 @@ to be stolen in the first place; outside the window any older generation revokes
 `REFRESH_GRACE` is the knob that trades retry-robustness against this window — keep it as
 small as real client/network latency allows.
 
+### 5a. Non-rotating mode (`as_refresh_rotation() == False`)
+All of the above — the chain map, generations, grace window, reuse detection — exists to
+make **rotation** safe. Rotation is OAuth 2.1's BCP for public clients, but it is only sound
+if the client reliably replaces its stored refresh token on every renewal; if it does not,
+*every* renewal after the first replays a now-stale token and (under strict revocation)
+forces a re-login — strictly worse than no refresh at all. Because that client behavior is
+**unverified** here (see §10 steps 4–5 and the §11 posture decision), the spec makes rotation
+a switch:
+- **Rotation off** → `/token` mints a fresh **access** token on each refresh grant but
+  returns **the same refresh token** (no new one), so there is no chain, no `_refresh_chain`
+  map, no reuse detection, no grace window, and no false-revoke failure mode. The refresh
+  token is a static bearer credential whose `exp` is fixed at login (30 d, *not* sliding —
+  re-login once a month). Weaker (a stolen refresh token is usable until that `exp`,
+  undetected), but mitigated by short access tokens and by signing-key rotation as the blunt
+  revoke. Robust and simple — the natural starting posture for a single-user server.
+- **Rotation on** → the full §5 machinery. Choose once the client is observed to honor
+  rotated tokens.
+
+The two share the issuance path (§4.1) and the access-token mint; they differ only in
+whether step 4 of §4.2 issues a new refresh token and touches the chain map.
+
 This gives correct rotation + reuse detection + retry-safety on a single machine with no
-datastore. §7 covers what changes across a restart and for multi-node.
+datastore (rotation on), or a simple robust static credential (rotation off). §7 covers what
+changes across a restart and for multi-node.
 
 ## 6. Config surface (additions to `ConfigProvider`)
 
@@ -182,6 +227,9 @@ def as_access_ttl(self) -> int: ...         # default: 3600 if refresh enabled, 
                                             #          as_token_ttl()  (see §3 — avoids
                                             #          inheriting the 7-day quick-fix TTL)
 def as_refresh_ttl(self) -> int: ...        # default 2_592_000 (30 d)
+def as_refresh_rotation(self) -> bool: ...  # rotate + reuse-detect (True) vs static
+                                            #   non-rotating refresh token (False).
+                                            #   Deployed default pending the §11 posture call.
 ```
 
 Host env wiring (one row per service, mirroring the existing `*_AS_TOKEN_TTL`):
@@ -191,6 +239,9 @@ Host env wiring (one row per service, mirroring the existing `*_AS_TOKEN_TTL`):
 | activities-mcp | `ACTIVITIES_AS_REFRESH_ENABLED` | `ACTIVITIES_AS_ACCESS_TTL` | `ACTIVITIES_AS_REFRESH_TTL` |
 | vitals-mcp | `VITALS_MCP_AS_REFRESH_ENABLED` | `VITALS_MCP_AS_ACCESS_TTL` | `VITALS_MCP_AS_REFRESH_TTL` |
 | genoscope | `GENOSCOPE_AS_REFRESH_ENABLED` | `GENOSCOPE_AS_ACCESS_TTL` | `GENOSCOPE_AS_REFRESH_TTL` |
+
+Plus `*_AS_REFRESH_ROTATION` (bool) per host, backing `as_refresh_rotation()` — value set by
+the §11 posture decision (start `0`/off per §10).
 
 Because `mcp_oauth.config.ConfigProvider` is a `Protocol`, adding methods is source-compat;
 hosts that don't yet define them must be given the defaults. **Implementation note:** since
@@ -203,6 +254,10 @@ future move to **C** would add `as_refresh_store_path() -> str | None`, the volu
 SQLite path.)
 
 ## 7. Restart behaviour & the autodeploy interaction (the key decision)
+
+**Applies only under rotation-on (§5).** With rotation off (§5a) there is no chain map to
+persist — a static refresh token verifies statelessly from its signature, so restarts and
+redeploys are a non-issue and the A/B/C choice below is moot.
 
 The `_refresh_chain` map is **in-process**, matching today's `_seen_jti` and the
 `min_machines_running=1`, no-scale deploy (`fly.toml`). A **process restart / redeploy
@@ -245,13 +300,17 @@ backing-store swap with the §5 rotation logic unchanged.
 
 ## 8. Security checklist (OAuth 2.1 BCP)
 
-- [ ] Refresh token is rotated on every use; old generation invalidated.
-- [ ] A benign retry of the immediately-previous generation **within** the grace window is
-      idempotent (returns the current token, no rotation, no revoke); the **same** token
-      presented **after** the window, or any older generation, revokes the chain.
-- [ ] Reuse of a rotated token (outside grace) revokes the entire chain (`sid`).
-- [ ] `REFRESH_GRACE` kept small (default 30 s): a predecessor token replayed *inside* the
-      window yields the current token (inherent grace-window exposure, §5) — tune deliberately.
+Items tagged **(rot)** apply only when rotation is enabled (§5a); in static mode they are
+n/a and the relevant guarantee is "short access TTL + signing-key revocation" instead.
+
+- [ ] **(rot)** Refresh token is rotated on every use; old generation invalidated.
+- [ ] **(rot)** A benign retry of the immediately-previous generation **within** the grace
+      window is idempotent (returns the current token, no rotation, no revoke); the **same**
+      token presented **after** the window, or any older generation, revokes the chain.
+- [ ] **(rot)** Reuse of a rotated token (outside grace) revokes the entire chain (`sid`).
+- [ ] **(rot)** `REFRESH_GRACE` set above real client retry/backoff: a predecessor token
+      replayed *inside* the window yields the current token (inherent grace-window exposure,
+      §5) — tune deliberately against the false-revoke-vs-exposure trade.
 - [ ] Refresh token bound to `resource` (`res` claim); audience-confused renewal rejected.
 - [ ] Access TTL short (default 1 h) so a leaked **access** token expires fast.
 - [ ] Refresh token is HS256 with a secret derived from the RSA signing key — rotating the
@@ -286,28 +345,53 @@ backing-store swap with the §5 rotation logic unchanged.
     (no spurious `invalid_grant`).
 12. **No jti single-use**: the idempotent grace retry returns a token whose `jti` was already
     seen → still accepted (guards against an accidental `_seen_jti` check on refresh tokens).
+13. **Non-rotating mode** (`as_refresh_rotation() == False`, §5a): a refresh grant returns a
+    fresh access token and the **same** refresh token (no new one); presenting that same
+    refresh token repeatedly keeps working with **no** rotation and **no** revoke; an expired
+    static refresh token → `invalid_grant`. (Tests 2–4/10–12, which assert rotation, are
+    skipped/inapplicable in this mode.)
 
 ## 10. Rollout
 
 1. Land this package change behind `as_refresh_enabled()` (default off) + tests. No host
    behaviour changes until opted in.
 2. Tag a release; bump each host's `mcp-oauth` pin (`pip install "mcp-oauth @ git+...@<tag>"`).
-3. Per host: add the three env accessors to its `config.py` + adapter, set
-   `*_AS_REFRESH_ENABLED=1`, `*_AS_ACCESS_TTL=3600`, `*_AS_REFRESH_TTL=2592000` as Fly
-   secrets, and **revert** the quick-fix `*_AS_TOKEN_TTL=604800` back to the short default
-   (its only remaining use is the webapp session-cookie lifetime — pick a deliberate value
-   there).
-4. Verify: log in once, confirm the client silently renews after the access TTL elapses
-   (token endpoint shows a `refresh_token` round-trip), and confirm a redeploy followed by a
-   renewal **succeeds without an interactive re-login** (policy B trust-on-first-use), then
-   that subsequent rotation is enforced normally.
+3. Per host: add the env accessors to its `config.py` + adapter, set `*_AS_REFRESH_ENABLED=1`,
+   `*_AS_ACCESS_TTL=3600`, `*_AS_REFRESH_TTL=2592000`. **Start safe with
+   `*_AS_REFRESH_ROTATION=0`** (non-rotating, §5a — no chain, no false-revoke failure mode),
+   unless the §11 posture decision says otherwise. **Revert** the quick-fix
+   `*_AS_TOKEN_TTL=604800` to a deliberate session-cookie value (its only remaining use).
+4. Verify (rotation off): log in once, let the access token expire, confirm the client
+   **silently renews** (a `refresh_token` grant round-trip, no interactive login) and keeps
+   working across a redeploy.
+5. **Empirical rotation gate** (only if pursuing rotation-on): flip `*_AS_REFRESH_ROTATION=1`
+   and watch several renewals — confirm the client presents a *new* (rotated) refresh token
+   each time and never gets bounced to an interactive login (incl. across a redeploy, exercising
+   §5 TOFU). If any unexpected re-login appears, the client isn't honoring rotation cleanly →
+   set rotation back to `0`. This observation is the evidence the §11 posture decision needs;
+   do not enable rotation fleet-wide on assumption.
 
 ## 11. Open questions
 
-- ~~Store durability — A / B / C (§7).~~ **Resolved: policy B** (in-memory,
-  trust-on-first-use). B → C (volume SQLite) is the documented upgrade if the restart-window
-  reuse-detection weakness ever matters or scale-out is needed.
-- Do we want an absolute session cap (§7) now, or defer until there's a reason?
+- **NEEDS A DECISION — refresh posture (rotation on/off), `as_refresh_rotation()`.** This is
+  the one substantive call left, because a false reuse-detection trip = the exact interactive
+  re-login this spec exists to remove, and rotation's correctness depends on the real MCP
+  client honoring rotated tokens — which is **unverified**. Three coherent postures:
+  - **Static / rotation-off (§5a)** — fresh access token each refresh, same long-lived
+    refresh token; no chain, no false-revoke, monthly hard re-login at the refresh `exp`.
+    Robust, simplest, BCP-noncompliant. *Recommended starting posture* for a single-user,
+    HTTPS-only server, and consistent with the earlier "never re-login on deploy" priority.
+  - **Rotate + reuse-detect (full §5)** — BCP-correct, ejects a stolen refresh token via the
+    revoke tripwire, sliding expiry so an active session never re-logins. Cost: depends on
+    client rotation behavior; a slow/lost retry past `REFRESH_GRACE` causes a false re-login.
+    Adopt **after** the §10 step-5 empirical gate passes.
+  - **Rotate + reject-stale-without-revoke** — middle ground; removes the false-revoke
+    lockout but also removes the theft tripwire (and can still strand the victim under real
+    theft), so it mostly combines the downsides. Listed for completeness; not recommended.
+  Sub-decision if rotating: `REFRESH_GRACE` size (default 30 s) — set it above the client's
+  real refresh retry/backoff, likely 1–5 min, to avoid false revokes.
+- Do we want an absolute session cap (§7) now, or defer? (Note: rotation-**off** already
+  imposes a natural ~monthly cap via the fixed refresh `exp`; rotation-**on** does not.)
 - Webapp **session cookie** lifetime: keep tying it to `as_token_ttl()`, or give it its own
   accessor so the access-token change doesn't silently shorten browser sessions? (Leaning:
   give it `as_session_ttl()` defaulting to `as_token_ttl()` to avoid coupling.)
