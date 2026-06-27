@@ -307,6 +307,96 @@ class AuthServerTests(unittest.TestCase):
         with env(GENOSCOPE_AS_ENABLED=None):
             self.assertEqual(a.auth_server_routes(), [])
 
+    # ── refresh tokens (static / non-rotating, refresh-tokens.spec §5a) ──────
+    def _refresh(self, refresh_token, **over):
+        form = {"grant_type": "refresh_token", "refresh_token": refresh_token,
+                "resource": RESOURCE}
+        form.update(over)
+        return run(_request(self.app, "POST", "/token", form=form))
+
+    def test_refresh_disabled_by_default(self):
+        # default cfg has no as_refresh_* accessors: code exchange yields no refresh_token,
+        # and the refresh grant is unsupported (back-compat / spec §9.1, §4.2 step 0).
+        self.assertFalse(a._refresh_enabled())
+        self.assertEqual(a._access_ttl(), 3600)               # falls back to as_token_ttl()
+        d = json.loads(self._exchange(self._code_from(self._authorize()[1]))[2])
+        self.assertNotIn("refresh_token", d)
+        s, _, b = self._refresh("anything")
+        self.assertEqual(s, 400)
+        self.assertEqual(json.loads(b)["error"], "unsupported_grant_type")
+
+    def test_metadata_advertises_refresh_iff_enabled(self):
+        path = "/.well-known/oauth-authorization-server"
+        m = json.loads(run(_request(self.app, "GET", path))[2])
+        self.assertEqual(m["grant_types_supported"], ["authorization_code"])
+        self.cfg.d["as_refresh_enabled"] = True
+        m2 = json.loads(run(_request(self.app, "GET", path))[2])
+        self.assertIn("refresh_token", m2["grant_types_supported"])
+
+    def test_refresh_issued_and_static_renew(self):
+        self.cfg.d["as_refresh_enabled"] = True
+        d = json.loads(self._exchange(self._code_from(self._authorize()[1]))[2])
+        rt = d["refresh_token"]
+        self.assertTrue(rt)
+        # renew: fresh, valid access token + the *same* refresh token (static, no rotation)
+        s, _, b = self._refresh(rt)
+        self.assertEqual(s, 200)
+        d2 = json.loads(b)
+        claims = jwt.decode(d2["access_token"], self._pubkey(), algorithms=["RS256"],
+                            audience=RESOURCE, issuer=ISS)
+        self.assertEqual(claims["sub"], USERNAME)
+        self.assertEqual(d2["refresh_token"], rt)
+        # the same token keeps working (no single-use revoke in static mode)
+        self.assertEqual(self._refresh(rt)[0], 200)
+
+    def test_refresh_access_ttl_short_despite_long_token_ttl(self):
+        # the footgun guard (spec §3): refresh on + a 7-day as_token_ttl must NOT leak into
+        # the access token — it stays 3600 — while the refresh token carries the 30 d default.
+        self.cfg.d.update(as_token_ttl=604_800, as_refresh_enabled=True)
+        d = json.loads(self._exchange(self._code_from(self._authorize()[1]))[2])
+        self.assertEqual(d["expires_in"], 3600)
+        ac = jwt.decode(d["access_token"], self._pubkey(), algorithms=["RS256"],
+                        audience=RESOURCE, issuer=ISS)
+        self.assertEqual(ac["exp"] - ac["iat"], 3600)
+        rc = jwt.decode(d["refresh_token"], a._refresh_secret(), algorithms=["HS256"])
+        self.assertEqual(rc["exp"] - rc["iat"], 2_592_000)
+
+    def test_refresh_expiry(self):
+        self.cfg.d["as_refresh_enabled"] = True
+        now = int(time.time())
+        expired = jwt.encode(
+            {"typ": "refresh", "sub": USERNAME, "res": RESOURCE, "sid": "s", "gen": 0,
+             "jti": "j", "iat": now - 600, "exp": now - 540},
+            a._refresh_secret(), algorithm="HS256")
+        s, _, b = self._refresh(expired)
+        self.assertEqual(s, 400)
+        self.assertEqual(json.loads(b)["error"], "invalid_grant")
+
+    def test_refresh_resource_binding(self):
+        self.cfg.d["as_refresh_enabled"] = True
+        rt = json.loads(self._exchange(self._code_from(self._authorize()[1]))[2])["refresh_token"]
+        s, _, b = self._refresh(rt, resource="https://other.example/mcp")
+        self.assertEqual(s, 400)
+        self.assertEqual(json.loads(b)["error"], "invalid_grant")
+
+    def test_refresh_tampering_rejected(self):
+        self.cfg.d["as_refresh_enabled"] = True
+        now = int(time.time())
+        forged = jwt.encode(
+            {"typ": "refresh", "sub": USERNAME, "res": RESOURCE, "sid": "s", "gen": 0,
+             "jti": "j", "iat": now, "exp": now + 1000},
+            b"not-the-refresh-secret-but-32-bytes!", algorithm="HS256")
+        s, _, b = self._refresh(forged)
+        self.assertEqual(s, 400)
+        self.assertEqual(json.loads(b)["error"], "invalid_grant")
+
+    def test_access_token_not_accepted_as_refresh(self):
+        # a wrong-typ token (an access JWT, or anything without typ=refresh) is rejected
+        self.cfg.d["as_refresh_enabled"] = True
+        s, _, b = self._refresh(a._mint_access_token(USERNAME, RESOURCE))
+        self.assertEqual(s, 400)
+        self.assertEqual(json.loads(b)["error"], "invalid_grant")
+
 
 if __name__ == "__main__":
     unittest.main()

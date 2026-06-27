@@ -37,6 +37,13 @@ class ConfigProvider(Protocol):
     def as_token_ttl(self) -> int: ...
     def as_client_id_allowlist(self) -> set[str]: ...
 
+    # ── refresh tokens (optional; the auth server reads these via getattr with the
+    # defaults below, so a host adapter that predates them keeps working) ─────────
+    # def as_refresh_enabled(self) -> bool: ...    # default False (no refresh token issued)
+    # def as_access_ttl(self) -> int: ...          # default 3600 when refresh on, else as_token_ttl()
+    # def as_refresh_ttl(self) -> int: ...         # default 2_592_000 (30 d)
+    # def as_refresh_rotation(self) -> bool: ...   # default False (static, non-rotating — spec §5a)
+
 
 @dataclass(frozen=True)
 class Branding:
