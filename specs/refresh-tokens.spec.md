@@ -199,8 +199,8 @@ if the client reliably replaces its stored refresh token on every renewal; if it
 forces a re-login — strictly worse than no refresh at all. Because that client behavior is
 **unverified** here (see §10 steps 4–5 and the §11 posture decision), the spec makes rotation
 a switch:
-- **Rotation off** → `/token` mints a fresh **access** token on each refresh grant but
-  returns **the same refresh token** (no new one), so there is no chain, no `_refresh_chain`
+- **Rotation off — CHOSEN default (§11)** → `/token` mints a fresh **access** token on each
+  refresh grant but returns **the same refresh token** (no new one), so there is no chain, no `_refresh_chain`
   map, no reuse detection, no grace window, and no false-revoke failure mode. The refresh
   token is a static bearer credential whose `exp` is fixed at login (30 d, *not* sliding —
   re-login once a month). Weaker (a stolen refresh token is usable until that `exp`,
@@ -229,7 +229,9 @@ def as_access_ttl(self) -> int: ...         # default: 3600 if refresh enabled, 
 def as_refresh_ttl(self) -> int: ...        # default 2_592_000 (30 d)
 def as_refresh_rotation(self) -> bool: ...  # rotate + reuse-detect (True) vs static
                                             #   non-rotating refresh token (False).
-                                            #   Deployed default pending the §11 posture call.
+                                            #   Deployed value: False (§11 decision); the
+                                            #   accessor default may stay True (BCP) — hosts
+                                            #   ship *_AS_REFRESH_ROTATION=0 explicitly.
 ```
 
 Host env wiring (one row per service, mirroring the existing `*_AS_TOKEN_TTL`):
@@ -255,9 +257,11 @@ SQLite path.)
 
 ## 7. Restart behaviour & the autodeploy interaction (the key decision)
 
-**Applies only under rotation-on (§5).** With rotation off (§5a) there is no chain map to
-persist — a static refresh token verifies statelessly from its signature, so restarts and
-redeploys are a non-issue and the A/B/C choice below is moot.
+**Applies only under rotation-on (§5) — i.e. NOT the chosen initial posture (§11).** With
+rotation off (§5a, the committed default) there is no chain map to persist: a static refresh
+token verifies statelessly from its signature, so restarts and redeploys are a non-issue and
+the A/B/C choice below is moot. This section (and its "Decision: policy B") is parked, taking
+effect only if rotation is later enabled via the §10 gate.
 
 The `_refresh_chain` map is **in-process**, matching today's `_seen_jti` and the
 `min_machines_running=1`, no-scale deploy (`fly.toml`). A **process restart / redeploy
@@ -357,14 +361,15 @@ n/a and the relevant guarantee is "short access TTL + signing-key revocation" in
    behaviour changes until opted in.
 2. Tag a release; bump each host's `mcp-oauth` pin (`pip install "mcp-oauth @ git+...@<tag>"`).
 3. Per host: add the env accessors to its `config.py` + adapter, set `*_AS_REFRESH_ENABLED=1`,
-   `*_AS_ACCESS_TTL=3600`, `*_AS_REFRESH_TTL=2592000`. **Start safe with
-   `*_AS_REFRESH_ROTATION=0`** (non-rotating, §5a — no chain, no false-revoke failure mode),
-   unless the §11 posture decision says otherwise. **Revert** the quick-fix
-   `*_AS_TOKEN_TTL=604800` to a deliberate session-cookie value (its only remaining use).
+   `*_AS_ACCESS_TTL=3600`, `*_AS_REFRESH_TTL=2592000`, and `*_AS_REFRESH_ROTATION=0`
+   (non-rotating — the §11 committed posture; no chain, no false-revoke failure mode).
+   **Revert** the quick-fix `*_AS_TOKEN_TTL=604800` to a deliberate session-cookie value (its
+   only remaining use).
 4. Verify (rotation off): log in once, let the access token expire, confirm the client
    **silently renews** (a `refresh_token` grant round-trip, no interactive login) and keeps
    working across a redeploy.
-5. **Empirical rotation gate** (only if pursuing rotation-on): flip `*_AS_REFRESH_ROTATION=1`
+5. **Future / optional — empirical rotation gate** (not part of the initial ship; only if
+   later pursuing rotation-on): flip `*_AS_REFRESH_ROTATION=1`
    and watch several renewals — confirm the client presents a *new* (rotated) refresh token
    each time and never gets bounced to an interactive login (incl. across a redeploy, exercising
    §5 TOFU). If any unexpected re-login appears, the client isn't honoring rotation cleanly →
@@ -373,14 +378,17 @@ n/a and the relevant guarantee is "short access TTL + signing-key revocation" in
 
 ## 11. Open questions
 
-- **NEEDS A DECISION — refresh posture (rotation on/off), `as_refresh_rotation()`.** This is
-  the one substantive call left, because a false reuse-detection trip = the exact interactive
-  re-login this spec exists to remove, and rotation's correctness depends on the real MCP
-  client honoring rotated tokens — which is **unverified**. Three coherent postures:
-  - **Static / rotation-off (§5a)** — fresh access token each refresh, same long-lived
-    refresh token; no chain, no false-revoke, monthly hard re-login at the refresh `exp`.
-    Robust, simplest, BCP-noncompliant. *Recommended starting posture* for a single-user,
-    HTTPS-only server, and consistent with the earlier "never re-login on deploy" priority.
+- ~~Refresh posture (rotation on/off), `as_refresh_rotation()`.~~ **Resolved: non-rotating
+  (rotation OFF) for the initial deploy** (`as_refresh_rotation() == False`, §5a). Rationale:
+  a false reuse-detection trip = the exact interactive re-login this spec exists to remove,
+  and rotation's correctness depends on the real MCP client honoring rotated tokens — which is
+  **unverified**. Rotation-on (full §5, incl. the store policy B in §7) remains a documented
+  upgrade, adopted only **after** the §10 empirical gate observes clean client rotation. The
+  three postures weighed:
+  - **Static / rotation-off (§5a)** — **← CHOSEN.** Fresh access token each refresh, same
+    long-lived refresh token; no chain, no false-revoke, monthly hard re-login at the refresh
+    `exp`. Robust, simplest, BCP-noncompliant. Best fit for a single-user, HTTPS-only server,
+    and consistent with the earlier "never re-login on deploy" priority.
   - **Rotate + reuse-detect (full §5)** — BCP-correct, ejects a stolen refresh token via the
     revoke tripwire, sliding expiry so an active session never re-logins. Cost: depends on
     client rotation behavior; a slow/lost retry past `REFRESH_GRACE` causes a false re-login.
