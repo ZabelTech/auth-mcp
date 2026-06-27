@@ -118,8 +118,9 @@ _refresh_chain: dict[sid, {gen: int, token: str, rotated_at: int, exp: int}]
 
 - On `authorization_code` issuance: `sid = token_urlsafe(16)`, `gen = 0`, store the entry.
 - On refresh, let `g` = presented `gen`:
-  - **`sid` unknown** → predates this process / pruned → §7 restart policy (default: reject
-    `invalid_grant`; client falls back to interactive login).
+  - **`sid` unknown** → predates this process / pruned (e.g. after a redeploy) →
+    **trust-on-first-use** (§7, chosen policy **B**): accept once, seed the entry at the
+    presented `gen`, and enforce rotation strictly from there. No interactive re-login.
   - **`g == gen`** (current token) → valid. Rotate: issue `gen+1`, update the entry
     (`gen+1`, new token, `rotated_at=now`). Return new access + new refresh token.
   - **`g == gen - 1` within the rotation grace window** (`now - rotated_at <=
@@ -167,8 +168,9 @@ the package calls `provider().as_refresh_enabled()` directly, provide the defaul
 small shim in `mcp_oauth` (e.g. module-level helpers `refresh_enabled()/access_ttl()/
 refresh_ttl()` that `getattr(provider(), name, default)()`), so an un-updated host adapter
 doesn't `AttributeError`. This keeps the "host passes its config module directly" contract.
-If policy **C** (§7) is chosen, add an `as_refresh_store_path() -> str | None` accessor
-too (the volume-backed SQLite path; `None` selects the in-memory store, A/B).
+(No store-path accessor is needed for the chosen policy **B** — the store is in-memory; a
+future move to **C** would add `as_refresh_store_path() -> str | None`, the volume-backed
+SQLite path.)
 
 ## 7. Restart behaviour & the autodeploy interaction (the key decision)
 
@@ -182,27 +184,31 @@ renewal.
 for the others). A redeploy on every merge means: with an in-memory store, *every merge
 invalidates all refresh sessions*. Policy A below would then force an interactive re-login
 after each deploy — quietly recreating much of the daily-login pain we set out to remove.
-So the store-durability choice is **coupled to deploy cadence**, and is the main judgement
-call this spec defers (see §11):
+So the store-durability choice is **coupled to deploy cadence**. **Decision: policy B**
+(in-memory + trust-on-first-use) — chosen for a single-user deploy where avoiding a
+re-login on every autodeploy outweighs the narrow restart-window risk, and where adding
+persistence isn't worth it yet. The three options considered:
 
 - **A. In-memory + reject on unknown `sid`** (safe, simplest, zero new infra): strict reuse
   detection; one interactive re-login per redeploy per active session. Fine if deploys are
   rare; **poor fit for frequent autodeploys.**
-- **B. In-memory + trust-on-first-use**: accept an unknown `sid` once, seeding the entry at
-  the presented `gen`, then enforce. Survives restarts without infra, but weakens reuse
-  detection across a restart boundary (a predecessor token stolen just before a restart can
-  be replayed once after).
-- **C. Persist the chain on the Fly volume (SQLite)**: the hosts already mount a volume
-  (e.g. activities `/data`, `ACTIVITIES_PLANS_DB`). A tiny `refresh_chains` table behind the
-  same `get/set/delete(sid)` interface survives redeploys with **full** reuse detection and
-  no extra service. Costs a small schema + the single-writer assumption (still one machine).
-  **Best fit given autodeploy**, at the price of a little persistence code + tests.
+- **B. In-memory + trust-on-first-use** — **CHOSEN**: on an unknown `sid`, accept once,
+  seed the entry at the presented `gen`, then enforce rotation strictly. Survives restarts
+  with no infra and no re-login. Trade-off: across a restart boundary reuse detection is
+  weakened — a predecessor token stolen just before a restart can be redeemed once after,
+  and the "who presents first" race is no longer adjudicated by server memory. Acceptable
+  for a single-user, HTTPS-only, low-exposure surface; revisit if the threat model changes.
+- **C. Persist the chain on the Fly volume (SQLite)** (not chosen now): the hosts already
+  mount a volume (e.g. activities `/data`, `ACTIVITIES_PLANS_DB`). A tiny `refresh_chains`
+  table behind the same interface survives redeploys with **full** reuse detection and no
+  extra service. The natural upgrade from B if the restart-window weakness ever matters — it
+  closes B's hole and needs no client change.
 
-Whichever is chosen, keep it behind one narrow interface (`chain_get/chain_put/chain_del`)
-so A/B/C differ only in the backing store — the rotation logic in §5 is identical.
+Keep the store behind one narrow interface (`chain_get/chain_put/chain_del`) so B → C is a
+backing-store swap with the §5 rotation logic unchanged.
 
-- **Multi-node / scale-out** still breaks A/B; only C (or Redis) survives it. Out of scope
-  to *implement* multi-node, but choosing C now makes it a config swap later.
+- **Multi-node / scale-out** still breaks B; only C (or Redis) survives it. Out of scope to
+  *implement*; B → C is the migration path if scale-out is ever needed.
 - **Absolute session cap**: sliding expiry means an actively-refreshed session never forces
   re-login. If a hard cap is desired, add `as_refresh_absolute_ttl()` and stamp an `iss_at`
   in the chain; out of scope for v1.
@@ -239,8 +245,10 @@ so A/B/C differ only in the backing store — the rotation logic in §5 is ident
 8. **Metadata**: `grant_types_supported` includes `refresh_token` iff enabled.
 9. **Back-compat**: a provider lacking the new accessors (old adapter) still works — access
    TTL falls back to `as_token_ttl()`, refresh disabled.
-10. **Restart policy**: simulate a cleared chain store (unknown `sid`) → matches the chosen
-    policy A/B/C (C: seed from the persisted row and succeed).
+10. **Restart policy (B / TOFU)**: simulate a cleared store (unknown `sid`) → the first
+    refresh is **accepted** and seeds the chain at the presented `gen`; a *second* refresh
+    with that same now-superseded `gen` (after rotation) is then rejected/revoked as normal —
+    i.e. enforcement resumes immediately after the trust-on-first-use seed.
 
 ## 10. Rollout
 
@@ -253,17 +261,15 @@ so A/B/C differ only in the backing store — the rotation logic in §5 is ident
    (its only remaining use is the webapp session-cookie lifetime — pick a deliberate value
    there).
 4. Verify: log in once, confirm the client silently renews after the access TTL elapses
-   (token endpoint shows a `refresh_token` round-trip), and — for policies A/B — confirm a
-   redeploy triggers at most one interactive re-login; for policy C, confirm renewal
-   survives a redeploy with no re-login.
+   (token endpoint shows a `refresh_token` round-trip), and confirm a redeploy followed by a
+   renewal **succeeds without an interactive re-login** (policy B trust-on-first-use), then
+   that subsequent rotation is enforced normally.
 
 ## 11. Open questions
 
-- **Store durability (the main call) — A / B / C from §7.** Because these hosts autodeploy
-  on push to `main`, an in-memory store (A/B) re-logs every active session on every merge.
-  Recommendation: **C (SQLite on the existing Fly volume)** — full reuse detection that
-  survives redeploys, no new service. A is acceptable only if we accept a re-login per
-  deploy; B trades a sliver of reuse-detection strength to avoid persistence code.
+- ~~Store durability — A / B / C (§7).~~ **Resolved: policy B** (in-memory,
+  trust-on-first-use). B → C (volume SQLite) is the documented upgrade if the restart-window
+  reuse-detection weakness ever matters or scale-out is needed.
 - Do we want an absolute session cap (§7) now, or defer until there's a reason?
 - Webapp **session cookie** lifetime: keep tying it to `as_token_ttl()`, or give it its own
   accessor so the access-token change doesn't silently shorten browser sessions? (Leaning:
