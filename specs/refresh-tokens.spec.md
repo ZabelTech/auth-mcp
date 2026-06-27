@@ -54,11 +54,22 @@ Today's relevant facts (all in `mcp_oauth/auth_server.py`):
 | Access | RS256 JWT (unchanged) | `as_access_ttl()` = 3600 s | new, replaces `as_token_ttl` for the access token |
 | Refresh | HS256 JWT, `_refresh_secret()` derived from the signing key (same pattern as `_code_secret()`) | `as_refresh_ttl()` = 2592000 s (30 d) | new |
 
-Keep `as_token_ttl()` as the access-token TTL for **back-compat**: `as_access_ttl()`
-defaults to `as_token_ttl()` if a host doesn't define it, and the webapp **session cookie**
-(`make_session`, `max_age` on the cookie) keeps using `as_token_ttl()` unchanged. So a host
-that adds nothing keeps today's single-TTL behaviour and still gets no refresh token (the
-grant is gated — see §6, `as_refresh_enabled()`).
+Back-compat without a footgun. `as_access_ttl()`'s default is **conditional on whether
+refresh is enabled**:
+- refresh **disabled** → defaults to `as_token_ttl()` — a non-opted host is byte-for-byte
+  unchanged (access token = today's single TTL).
+- refresh **enabled** but `as_access_ttl` unset → defaults to a hard **3600 s**, *not*
+  `as_token_ttl()`. This matters because rollout (§10) leaves the quick-fix
+  `*_AS_TOKEN_TTL=604800` (7 d) in place until a later step: if access TTL inherited that, an
+  operator who enabled refresh but forgot to set `AS_ACCESS_TTL` would silently keep
+  **7-day access tokens**, defeating the whole point. So once refresh is on, access tokens
+  are short by default regardless of `as_token_ttl()`.
+
+The webapp **session cookie** (`make_session`, `max_age`) keeps using `as_token_ttl()`
+unchanged — it is the browser-session lifetime, independent of the access-token TTL (see
+the §11 open question on giving it its own accessor). A host that adds nothing keeps today's
+single-TTL behaviour and still gets no refresh token (the grant is gated — see §6,
+`as_refresh_enabled()`).
 
 ### Refresh token claims (HS256, `_refresh_secret()`)
 ```
@@ -131,14 +142,31 @@ _refresh_chain: dict[sid, {gen: int, token: str, rotated_at: int, exp: int}]
     branching the chain, so the client converges on one valid token.)
   - **`g == gen - 1` after the grace window, or `g < gen - 1`** → **true reuse of a rotated
     token** → delete `sid` (revoke the chain), return `invalid_grant`. BCP breach response.
-  - **`g > gen`** → impossible under our signing → `invalid_grant`.
+  - **`g > gen`** → cannot happen under strict tracking, but **can** under policy B after a
+    TOFU seed at a low generation (the client legitimately holds a higher-gen token it
+    already had). Treat as a valid presentation: **re-seed upward** (set `gen = g`) and
+    rotate normally. The token is validly signed by us, so this is consistent with B's
+    first-presenter-trust posture and avoids a spurious re-login. (Under A/C this branch is
+    unreachable; rejecting there is fine.)
+- **Dedup is by `(sid, gen)` only — never by `jti`.** The `jti` claim exists for token
+  *uniqueness* and logging, not single-use enforcement. Do **not** add an auth-code-style
+  `_seen_jti` check for refresh tokens: the benign-retry path deliberately returns the
+  **same cached token** (same `jti`), so a per-`jti` single-use check would reject exactly
+  the idempotent retry the grace window is designed to allow.
 - Bound memory: prune an entry lazily once `entry.exp` is in the past (checked on access /
   on a size threshold). Same growth concern as `_seen_jti`; document the bound.
 
 The grace window closes the **rotation-retry race**: without it, any lost rotation response
 (network blip, client crash mid-exchange, 5xx) would trip reuse detection and force a full
-re-login — defeating the spec's purpose. The window is short enough that a genuinely stolen
-predecessor token is still caught once the legitimate client rotates past it.
+re-login — defeating the spec's purpose.
+
+Its cost, stated honestly: within `REFRESH_GRACE` the server cannot tell a legitimate retry
+from a replay, so a **stolen predecessor token presented inside the window yields the
+current token** (we must return it, or the genuine retrying client could never converge).
+The exposure is bounded by `REFRESH_GRACE` (default 30 s) and by requiring the predecessor
+to be stolen in the first place; outside the window any older generation revokes the chain.
+`REFRESH_GRACE` is the knob that trades retry-robustness against this window — keep it as
+small as real client/network latency allows.
 
 This gives correct rotation + reuse detection + retry-safety on a single machine with no
 datastore. §7 covers what changes across a restart and for multi-node.
@@ -150,7 +178,9 @@ existing host adapters keep working until they opt in:
 
 ```python
 def as_refresh_enabled(self) -> bool: ...   # default False  -> behaves exactly as today
-def as_access_ttl(self) -> int: ...         # default: self.as_token_ttl()  (back-compat)
+def as_access_ttl(self) -> int: ...         # default: 3600 if refresh enabled, else
+                                            #          as_token_ttl()  (see §3 — avoids
+                                            #          inheriting the 7-day quick-fix TTL)
 def as_refresh_ttl(self) -> int: ...        # default 2_592_000 (30 d)
 ```
 
@@ -220,6 +250,8 @@ backing-store swap with the §5 rotation logic unchanged.
       idempotent (returns the current token, no rotation, no revoke); the **same** token
       presented **after** the window, or any older generation, revokes the chain.
 - [ ] Reuse of a rotated token (outside grace) revokes the entire chain (`sid`).
+- [ ] `REFRESH_GRACE` kept small (default 30 s): a predecessor token replayed *inside* the
+      window yields the current token (inherent grace-window exposure, §5) — tune deliberately.
 - [ ] Refresh token bound to `resource` (`res` claim); audience-confused renewal rejected.
 - [ ] Access TTL short (default 1 h) so a leaked **access** token expires fast.
 - [ ] Refresh token is HS256 with a secret derived from the RSA signing key — rotating the
@@ -249,6 +281,11 @@ backing-store swap with the §5 rotation logic unchanged.
     refresh is **accepted** and seeds the chain at the presented `gen`; a *second* refresh
     with that same now-superseded `gen` (after rotation) is then rejected/revoked as normal —
     i.e. enforcement resumes immediately after the trust-on-first-use seed.
+11. **TOFU reseed-upward**: after a cleared store, seed via a low-gen token, then present a
+    higher-gen validly-signed token → **accepted**, chain re-seeds to that gen and rotates
+    (no spurious `invalid_grant`).
+12. **No jti single-use**: the idempotent grace retry returns a token whose `jti` was already
+    seen → still accepted (guards against an accidental `_seen_jti` check on refresh tokens).
 
 ## 10. Rollout
 
