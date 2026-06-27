@@ -8,7 +8,8 @@ already validates — so it drops in behind the existing gate as the issuer.
   GET  /.well-known/jwks.json                   the RS256 public key
   GET  /authorize                               login form
   POST /authorize                               verify credential -> auth code -> 302
-  POST /token                                   code + PKCE -> access token
+  POST /token                                   authorization_code (code+PKCE) or
+                                                refresh_token grant -> access token
 
 Auth codes are short-lived HS256 blobs (secret derived from the signing key), single-use
 via an in-memory jti set (the deploy is single-machine). The only outbound call is the
@@ -51,6 +52,37 @@ log = logging.getLogger("mcp_oauth.auth_server")
 
 _PBKDF2_ROUNDS = 600_000
 _CODE_TTL = 60  # seconds; the auth code is exchanged immediately
+
+# ── refresh-token settings, read through the provider with back-compat defaults so a host
+# whose adapter predates these accessors still works (refresh-tokens.spec §6). Only the
+# static, non-rotating refresh path is implemented (spec §5a); rotation (§5) is parked. ──
+_ACCESS_TTL_DEFAULT = 3600          # used when refresh is on but the host sets no access TTL
+_REFRESH_TTL_DEFAULT = 2_592_000    # 30 days
+
+
+def _refresh_enabled() -> bool:
+    return bool(getattr(provider(), "as_refresh_enabled", lambda: False)())
+
+
+def _access_ttl() -> int:
+    """Access-token lifetime. A host `as_access_ttl()` wins; else 3600 when refresh is
+    enabled (don't inherit a long `as_token_ttl` such as the 7-day quick fix), else
+    `as_token_ttl()` for byte-for-byte back-compat (spec §3)."""
+    fn = getattr(provider(), "as_access_ttl", None)
+    if fn is not None:
+        return fn()
+    return _ACCESS_TTL_DEFAULT if _refresh_enabled() else provider().as_token_ttl()
+
+
+def _refresh_ttl() -> int:
+    fn = getattr(provider(), "as_refresh_ttl", None)
+    return fn() if fn is not None else _REFRESH_TTL_DEFAULT
+
+
+def _refresh_rotation() -> bool:
+    """Rotation posture. Defaults False: only the static refresh path is implemented, so a
+    host must opt into rotation (spec §5) explicitly once that path exists."""
+    return bool(getattr(provider(), "as_refresh_rotation", lambda: False)())
 
 
 def _b64(b: bytes) -> str:
@@ -125,6 +157,13 @@ def _code_secret() -> bytes:
     return hashlib.sha256(("mcp-oauth-code:" + _private_key_pem()).encode()).digest()
 
 
+def _refresh_secret() -> bytes:
+    # Same derivation as the code secret with a distinct domain prefix: a refresh token can
+    # never be cross-validated as a code (or session), and rotating the RSA signing key
+    # invalidates every refresh token along with the codes and sessions.
+    return hashlib.sha256(("mcp-oauth-refresh:" + _private_key_pem()).encode()).digest()
+
+
 def _mint_code(*, code_challenge: str, redirect_uri: str, resource: str, sub: str) -> str:
     now = int(time.time())
     return jwt.encode(
@@ -151,8 +190,20 @@ def _mint_access_token(sub: str, resource: str) -> str:
     _, kid = _public_jwk_and_kid()
     return jwt.encode(
         {"iss": provider().oauth_issuer(), "sub": sub, "aud": resource,
-         "iat": now, "exp": now + provider().as_token_ttl(), "scope": ""},
+         "iat": now, "exp": now + _access_ttl(), "scope": ""},
         _private_key_pem(), algorithm="RS256", headers={"kid": kid})
+
+
+def _mint_refresh_token(sub: str, resource: str) -> str:
+    """A static (non-rotating) refresh token: an HS256 JWT bound to the subject and resource
+    (spec §3). `sid`/`gen` are carried for forward-compatibility with the rotation path but
+    are unused while rotation is off."""
+    now = int(time.time())
+    return jwt.encode(
+        {"typ": "refresh", "sub": sub, "res": resource,
+         "sid": secrets.token_urlsafe(16), "gen": 0, "jti": secrets.token_urlsafe(12),
+         "iat": now, "exp": now + _refresh_ttl()},
+        _refresh_secret(), algorithm="HS256")
 
 
 def _pkce_ok(verifier: str, challenge: str) -> bool:
@@ -218,7 +269,8 @@ async def authorization_server_metadata(request) -> Response:
         "token_endpoint": f"{iss}/token",
         "jwks_uri": f"{iss}/.well-known/jwks.json",
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code"],
+        "grant_types_supported": (["authorization_code", "refresh_token"]
+                                  if _refresh_enabled() else ["authorization_code"]),
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "client_id_metadata_document_supported": True,
@@ -299,7 +351,10 @@ def _token_error(code: str, status: int = 400) -> Response:
 
 async def token(request) -> Response:
     form = await request.form()
-    if form.get("grant_type") != "authorization_code":
+    grant = form.get("grant_type")
+    if grant == "refresh_token":
+        return _token_refresh(form)
+    if grant != "authorization_code":
         return _token_error("unsupported_grant_type")
     code, verifier = form.get("code", ""), form.get("code_verifier", "")
     redirect_uri, resource = form.get("redirect_uri", ""), form.get("resource", "")
@@ -311,9 +366,38 @@ async def token(request) -> Response:
         return _token_error("invalid_grant")
     if redirect_uri != claims["ru"] or (resource and resource != claims["res"]):
         return _token_error("invalid_grant")
-    tok = _mint_access_token(claims["sub"], claims["res"])
-    return JSONResponse({"access_token": tok, "token_type": "Bearer",
-                         "expires_in": provider().as_token_ttl(), "scope": ""})
+    body = {"access_token": _mint_access_token(claims["sub"], claims["res"]),
+            "token_type": "Bearer", "expires_in": _access_ttl(), "scope": ""}
+    if _refresh_enabled():
+        body["refresh_token"] = _mint_refresh_token(claims["sub"], claims["res"])
+    return JSONResponse(body)
+
+
+def _token_refresh(form) -> Response:
+    """The `refresh_token` grant — static (non-rotating) mode, spec §5a: verify the refresh
+    token, mint a fresh access token, and return the *same* refresh token. The whole
+    rotation machinery (§5) is parked; a host that sets `as_refresh_rotation` True still gets
+    static behaviour (logged once) until that path is built — never a silent failure."""
+    if not _refresh_enabled():
+        return _token_error("unsupported_grant_type")
+    try:
+        claims = jwt.decode(form.get("refresh_token", ""), _refresh_secret(),
+                            algorithms=["HS256"], leeway=30,
+                            options={"require": ["exp", "jti", "typ", "sub", "sid", "gen"]})
+    except Exception:  # noqa: BLE001 — bad/expired/forged refresh token
+        return _token_error("invalid_grant")
+    if claims.get("typ") != "refresh":
+        return _token_error("invalid_grant")
+    resource = form.get("resource", "")
+    if resource and resource != claims.get("res"):   # RFC 8707 audience binding
+        return _token_error("invalid_grant")
+    if _refresh_rotation():
+        log.warning("as_refresh_rotation is set but rotation is not implemented; serving "
+                    "static (non-rotating) refresh — see refresh-tokens.spec §5/§5a")
+    return JSONResponse({
+        "access_token": _mint_access_token(claims["sub"], claims.get("res", "")),
+        "token_type": "Bearer", "expires_in": _access_ttl(), "scope": "",
+        "refresh_token": form.get("refresh_token", "")})   # static: hand the same one back
 
 
 # ─── first-party browser session + webapp gate ──────────────────────────────

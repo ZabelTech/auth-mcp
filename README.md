@@ -13,7 +13,10 @@ Two surfaces, both reusable across hosts:
   token validity.
 - **`mcp_oauth.auth_server`** — a minimal self-hosted OAuth 2.1 authorization server that
   issues the RS256 JWTs the gate validates (CIMD-only, no DCR, single fixed credential),
-  plus the first-party webapp session-cookie gate (`WebappSessionMiddleware`).
+  plus the first-party webapp session-cookie gate (`WebappSessionMiddleware`). Optionally
+  issues **refresh tokens** (gated on `as_refresh_enabled()`) so a client renews a short
+  access token without re-running the interactive login — static / non-rotating by default
+  (`as_refresh_rotation()`); see `specs/refresh-tokens.spec.md`.
 
 ## Install
 
