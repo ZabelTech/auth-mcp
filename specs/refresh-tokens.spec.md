@@ -34,14 +34,17 @@ Today's relevant facts (all in `mcp_oauth/auth_server.py`):
   (default 1 h); refresh tokens carry the long lifetime (default 30 days).
 - Support **refresh-token rotation** with reuse detection (OAuth 2.1 BCP).
 - Stay within the package's constraints: host-injected config, no new runtime dependency
-  beyond `pyjwt[crypto]`, and **no required external datastore** for the baseline.
+  beyond `pyjwt[crypto]` (stdlib `sqlite3` is acceptable for store option C), and **no new
+  network service** — the rotation state lives in-process or in a local volume-backed file,
+  never an external broker.
 - Backwards compatible: a host that does not opt in behaves exactly as today.
 
 **Non-goals**
 - Dynamic client registration, multiple users/clients, or scopes (still single fixed
   subject, CIMD-only).
-- A persistent multi-node token store (see §7 — the stateless rotation scheme tolerates the
-  single-machine deploy; a DB-backed store is a documented future option, not this spec).
+- A **multi-node / networked** token store (Redis, a shared DB service). The rotation-state
+  store stays single-writer to match the single-machine deploy; the only durability choice
+  on the table (§7 option C) is local SQLite on the Fly volume, not a separate service.
 - Changing the resource-server verifier — access tokens are unchanged RS256 JWTs.
 
 ## 3. Token model
@@ -103,25 +106,41 @@ token itself is the bearer credential for renewal.
 ## 5. Rotation & reuse detection (stateless baseline)
 
 OAuth 2.1 requires rotation for public clients. We do it without a DB, exploiting the
-single-machine deploy and the existing in-memory `jti` pattern:
+single-machine deploy and the existing in-memory `jti` pattern.
 
-- Maintain an in-memory map `_refresh_gen: dict[sid, int]` = highest generation issued for
-  that `sid`. (Mirrors `_seen_jti`; lives for process lifetime.)
-- On `authorization_code` issuance: `sid = token_urlsafe(16)`, `gen = 0`,
-  `_refresh_gen[sid] = 0`.
-- On refresh: let `g` = presented `gen`.
-  - If `sid` unknown → token predates this process / was pruned → treat per §7 restart
-    policy (default: reject with `invalid_grant`; client falls back to interactive login).
-  - If `g < _refresh_gen[sid]` → **reuse of a rotated token** → delete `sid` from the map
-    (revoke the chain) and return `invalid_grant`. This is the BCP breach response.
-  - If `g == _refresh_gen[sid]` → valid; set `_refresh_gen[sid] = g + 1`, issue `gen=g+1`.
-  - If `g > _refresh_gen[sid]` → impossible under our signing; reject `invalid_grant`.
-- Bound memory: `_refresh_gen` entries are pruned lazily when their newest token would be
-  expired (track `iat`/`exp` alongside `gen`, drop on access). Same single-use-set growth
-  concern as `_seen_jti`; document the bound.
+Per-session state map (mirrors `_seen_jti`; lives for process lifetime):
+```
+_refresh_chain: dict[sid, {gen: int, token: str, rotated_at: int, exp: int}]
+#                              ^highest issued  ^the current refresh token string (for
+#                                                idempotent retry), ^when gen was last
+#                                                bumped, ^newest token's expiry (for pruning)
+```
 
-This gives correct rotation + reuse detection on a single machine with no datastore. §7
-covers what changes for multi-node.
+- On `authorization_code` issuance: `sid = token_urlsafe(16)`, `gen = 0`, store the entry.
+- On refresh, let `g` = presented `gen`:
+  - **`sid` unknown** → predates this process / pruned → §7 restart policy (default: reject
+    `invalid_grant`; client falls back to interactive login).
+  - **`g == gen`** (current token) → valid. Rotate: issue `gen+1`, update the entry
+    (`gen+1`, new token, `rotated_at=now`). Return new access + new refresh token.
+  - **`g == gen - 1` within the rotation grace window** (`now - rotated_at <=
+    REFRESH_GRACE`, default 30 s) → **benign retry**, not a breach: the client's previous
+    rotation response was almost certainly lost in transit. Return the *cached current*
+    token (`entry.token`) and a fresh access token — **idempotent**, do **not** rotate
+    again and do **not** revoke. (We return the same successor we already minted rather than
+    branching the chain, so the client converges on one valid token.)
+  - **`g == gen - 1` after the grace window, or `g < gen - 1`** → **true reuse of a rotated
+    token** → delete `sid` (revoke the chain), return `invalid_grant`. BCP breach response.
+  - **`g > gen`** → impossible under our signing → `invalid_grant`.
+- Bound memory: prune an entry lazily once `entry.exp` is in the past (checked on access /
+  on a size threshold). Same growth concern as `_seen_jti`; document the bound.
+
+The grace window closes the **rotation-retry race**: without it, any lost rotation response
+(network blip, client crash mid-exchange, 5xx) would trip reuse detection and force a full
+re-login — defeating the spec's purpose. The window is short enough that a genuinely stolen
+predecessor token is still caught once the legitimate client rotates past it.
+
+This gives correct rotation + reuse detection + retry-safety on a single machine with no
+datastore. §7 covers what changes across a restart and for multi-node.
 
 ## 6. Config surface (additions to `ConfigProvider`)
 
@@ -148,23 +167,42 @@ the package calls `provider().as_refresh_enabled()` directly, provide the defaul
 small shim in `mcp_oauth` (e.g. module-level helpers `refresh_enabled()/access_ttl()/
 refresh_ttl()` that `getattr(provider(), name, default)()`), so an un-updated host adapter
 doesn't `AttributeError`. This keeps the "host passes its config module directly" contract.
+If policy **C** (§7) is chosen, add an `as_refresh_store_path() -> str | None` accessor
+too (the volume-backed SQLite path; `None` selects the in-memory store, A/B).
 
-## 7. Single-machine assumption & restart behaviour
+## 7. Restart behaviour & the autodeploy interaction (the key decision)
 
-The reuse-detection map is **in-process**, matching today's `_seen_jti` and the
-`min_machines_running=1`, no-scale deploy (`fly.toml`). Consequences, to be explicit:
+The `_refresh_chain` map is **in-process**, matching today's `_seen_jti` and the
+`min_machines_running=1`, no-scale deploy (`fly.toml`). A **process restart / redeploy
+clears it**, so every still-valid refresh token hits the "`sid` unknown" path on its next
+renewal.
 
-- **Process restart / redeploy** clears `_refresh_gen`. A still-valid refresh token then
-  hits the "`sid` unknown" path. Two policies, choose one (default **A**):
-  - **A. Reject on unknown `sid`** (safe, simple): after a redeploy the next renewal fails
-    and the client does one interactive login. Strictly enforces reuse detection. Given
-    deploys are infrequent, this is an occasional extra login, not a daily one.
-  - **B. Trust-on-first-use**: accept an unknown `sid` once, seeding `_refresh_gen[sid] =
-    gen`, then enforce from there. Survives restarts but weakens reuse detection across a
-    restart boundary (a token stolen before a restart could be replayed once after).
-- **Multi-node / scale-out** would break the in-memory map. If that is ever needed, replace
-  `_refresh_gen` with a shared store (Redis/SQLite-on-volume) behind the same interface —
-  call out as a future change, **not** in scope here.
+**This matters more than it first appears, because these hosts now autodeploy on push to
+`main`** (the CI → Fly pipeline added in `activities-mcp`, and the same pattern is intended
+for the others). A redeploy on every merge means: with an in-memory store, *every merge
+invalidates all refresh sessions*. Policy A below would then force an interactive re-login
+after each deploy — quietly recreating much of the daily-login pain we set out to remove.
+So the store-durability choice is **coupled to deploy cadence**, and is the main judgement
+call this spec defers (see §11):
+
+- **A. In-memory + reject on unknown `sid`** (safe, simplest, zero new infra): strict reuse
+  detection; one interactive re-login per redeploy per active session. Fine if deploys are
+  rare; **poor fit for frequent autodeploys.**
+- **B. In-memory + trust-on-first-use**: accept an unknown `sid` once, seeding the entry at
+  the presented `gen`, then enforce. Survives restarts without infra, but weakens reuse
+  detection across a restart boundary (a predecessor token stolen just before a restart can
+  be replayed once after).
+- **C. Persist the chain on the Fly volume (SQLite)**: the hosts already mount a volume
+  (e.g. activities `/data`, `ACTIVITIES_PLANS_DB`). A tiny `refresh_chains` table behind the
+  same `get/set/delete(sid)` interface survives redeploys with **full** reuse detection and
+  no extra service. Costs a small schema + the single-writer assumption (still one machine).
+  **Best fit given autodeploy**, at the price of a little persistence code + tests.
+
+Whichever is chosen, keep it behind one narrow interface (`chain_get/chain_put/chain_del`)
+so A/B/C differ only in the backing store — the rotation logic in §5 is identical.
+
+- **Multi-node / scale-out** still breaks A/B; only C (or Redis) survives it. Out of scope
+  to *implement* multi-node, but choosing C now makes it a config swap later.
 - **Absolute session cap**: sliding expiry means an actively-refreshed session never forces
   re-login. If a hard cap is desired, add `as_refresh_absolute_ttl()` and stamp an `iss_at`
   in the chain; out of scope for v1.
@@ -172,7 +210,10 @@ The reuse-detection map is **in-process**, matching today's `_seen_jti` and the
 ## 8. Security checklist (OAuth 2.1 BCP)
 
 - [ ] Refresh token is rotated on every use; old generation invalidated.
-- [ ] Reuse of a rotated token revokes the entire chain (`sid`).
+- [ ] A benign retry of the immediately-previous generation **within** the grace window is
+      idempotent (returns the current token, no rotation, no revoke); the **same** token
+      presented **after** the window, or any older generation, revokes the chain.
+- [ ] Reuse of a rotated token (outside grace) revokes the entire chain (`sid`).
 - [ ] Refresh token bound to `resource` (`res` claim); audience-confused renewal rejected.
 - [ ] Access TTL short (default 1 h) so a leaked **access** token expires fast.
 - [ ] Refresh token is HS256 with a secret derived from the RSA signing key — rotating the
@@ -186,17 +227,20 @@ The reuse-detection map is **in-process**, matching today's `_seen_jti` and the
    when disabled (back-compat). `expires_in == as_access_ttl()`.
 2. **Renewal happy path**: `grant_type=refresh_token` returns a new access token and a new
    refresh token with `gen+1`, same `sid`.
-3. **Rotation invalidates predecessor**: renewing with generation `g` after `g+1` was
-   issued → `invalid_grant` **and** chain revoked (a subsequent renew with `g+1` also
-   fails).
-4. **Expiry**: an expired refresh token → `invalid_grant`.
-5. **Resource binding**: renewal with a mismatched `resource` → `invalid_grant`.
-6. **Tampering**: refresh token signed with the wrong secret / altered claims → rejected.
-7. **Metadata**: `grant_types_supported` includes `refresh_token` iff enabled.
-8. **Back-compat**: a provider lacking the new accessors (old adapter) still works — access
+3. **Rotation invalidates predecessor (true reuse)**: renew with `g`, then present `g` again
+   *after the grace window* → `invalid_grant` **and** chain revoked (a later renew with the
+   real current token also fails). Also test `g < gen-1` → immediate revoke.
+4. **Benign retry within grace**: present the previous generation while `now - rotated_at <=
+   REFRESH_GRACE` → returns the *current* refresh token unchanged (idempotent), a fresh
+   access token, no rotation, chain **not** revoked. (Drive time via an injectable clock.)
+5. **Expiry**: an expired refresh token → `invalid_grant`.
+6. **Resource binding**: renewal with a mismatched `resource` → `invalid_grant`.
+7. **Tampering**: refresh token signed with the wrong secret / altered claims → rejected.
+8. **Metadata**: `grant_types_supported` includes `refresh_token` iff enabled.
+9. **Back-compat**: a provider lacking the new accessors (old adapter) still works — access
    TTL falls back to `as_token_ttl()`, refresh disabled.
-9. **Restart policy**: simulate cleared `_refresh_gen` (unknown `sid`) → matches the chosen
-   policy A/B.
+10. **Restart policy**: simulate a cleared chain store (unknown `sid`) → matches the chosen
+    policy A/B/C (C: seed from the persisted row and succeed).
 
 ## 10. Rollout
 
@@ -209,13 +253,17 @@ The reuse-detection map is **in-process**, matching today's `_seen_jti` and the
    (its only remaining use is the webapp session-cookie lifetime — pick a deliberate value
    there).
 4. Verify: log in once, confirm the client silently renews after the access TTL elapses
-   (token endpoint shows a `refresh_token` round-trip), and confirm a redeploy triggers at
-   most one interactive re-login (policy A).
+   (token endpoint shows a `refresh_token` round-trip), and — for policies A/B — confirm a
+   redeploy triggers at most one interactive re-login; for policy C, confirm renewal
+   survives a redeploy with no re-login.
 
 ## 11. Open questions
 
-- Restart policy **A vs B** — default A (stricter). Confirm the redeploy cadence makes the
-  occasional extra login acceptable, else choose B.
+- **Store durability (the main call) — A / B / C from §7.** Because these hosts autodeploy
+  on push to `main`, an in-memory store (A/B) re-logs every active session on every merge.
+  Recommendation: **C (SQLite on the existing Fly volume)** — full reuse detection that
+  survives redeploys, no new service. A is acceptable only if we accept a re-login per
+  deploy; B trades a sliver of reuse-detection strength to avoid persistence code.
 - Do we want an absolute session cap (§7) now, or defer until there's a reason?
 - Webapp **session cookie** lifetime: keep tying it to `as_token_ttl()`, or give it its own
   accessor so the access-token change doesn't silently shorten browser sessions? (Leaning:
